@@ -215,6 +215,222 @@ def _answer_ask_inner(question: str, store: Store, user_id: int) -> str | None:
 
     # Identity / capabilities.
     if any(p in lowered for p in ("who are you", "what are you", "your name")):
+
+Everything here is rule-based and runs entirely on the server:
+  * notes are stored in the vault database,
+  * reminders are scheduled through python-telegram-bot's JobQueue,
+  * /ask answers questions about the vault, does safe arithmetic, tells the
+    date/time, and is honest about what it cannot do,
+  * plain chat (and /chat without a Gemini key) is answered in character
+    by the Sanctum's keeper — a geeky wizard guardian, a little mystical,
+    proud of keeping the vault safe.
+
+No message content ever leaves the machine. The external Gemini AI is a
+separate module (ai.py) and is only ever called by the /chat command.
+"""
+
+from __future__ import annotations
+
+import ast
+import math
+import re
+from datetime import datetime
+
+from vault import CATEGORY_LABELS, Store, human_size
+
+# ---------------------------------------------------------------------------
+# Safe arithmetic: only numbers and + - * / % ** // and parentheses.
+# A single message must never wedge the bot: the evaluator below refuses
+# any computation whose result would exceed _MAX_ARITH_BITS *before* the
+# big-int work happens (e.g. 9**9**9 is refused by a bit estimate, not
+# by computing a ~1.2-billion-bit number first). It never uses eval().
+# ---------------------------------------------------------------------------
+
+_MAX_ARITH_BITS = 4096   # largest integer result allowed (in bits)
+_MAX_ARITH_EXPR_LEN = 200  # longest expression accepted (characters)
+
+_ALLOWED_NODES = (
+    ast.Expression,
+    ast.BinOp,
+    ast.UnaryOp,
+    ast.Add,
+    ast.Sub,
+    ast.Mult,
+    ast.Div,
+    ast.Mod,
+    ast.Pow,
+    ast.FloorDiv,
+    ast.USub,
+    ast.UAdd,
+    ast.Constant,
+)
+
+
+def _check_result(result) -> int | float:
+    """Refuse results that are not plain finite numbers of sane size."""
+    if isinstance(result, bool):  # bool is an int subclass — never valid here
+        raise ValueError("not a number")
+    if isinstance(result, int):
+        if abs(result).bit_length() > _MAX_ARITH_BITS:
+            raise ValueError("that number is too large to compute")
+        return result
+    if isinstance(result, float):
+        if not math.isfinite(result):
+            raise ValueError("that number is too large to compute")
+        return result
+    raise ValueError("not a number")
+
+
+def _safe_pow(base, exp) -> int | float:
+    """Power with a pre-check: estimate the result's size in bits and
+    refuse before computing if it would exceed _MAX_ARITH_BITS.
+    This catches 9**9**9 (the inner 9**9 is 387420489, so the outer power
+    would be ~1.2 billion bits) without ever doing the giant multiply.
+    ZeroDivisionError (0**-1) propagates, as callers expect."""
+    if isinstance(exp, int) and exp >= 0 and base not in (0, 1, -1):
+        if isinstance(base, int):
+            # log2(base) is between bit_length-1 and bit_length; use the
+            # lower bound so the estimate never over-refuses by much, and
+            # _check_result enforces the exact cap on the real result.
+            est_bits = max(1, abs(base).bit_length() - 1) * exp
+        else:
+            est_bits = abs(math.log2(abs(base))) * exp if base else 0
+        if est_bits > _MAX_ARITH_BITS:
+            raise ValueError("that power is too large to compute")
+    return _check_result(base ** exp)
+
+
+def _eval_node(node: ast.AST) -> int | float:
+    """Recursively evaluate one AST node. Only plain arithmetic is
+    reachable here — the caller has already rejected every other node
+    type. Raises ValueError on anything too large to compute, and lets
+    ZeroDivisionError propagate (callers turn it into a polite reply)."""
+    if isinstance(node, ast.Expression):
+        return _eval_node(node.body)
+    if isinstance(node, ast.Constant):
+        if not isinstance(node.value, (int, float)):
+            raise ValueError("only numbers are allowed")
+        return node.value
+    if isinstance(node, ast.UnaryOp):
+        value = _eval_node(node.operand)
+        if isinstance(node.op, ast.USub):
+            return _check_result(-value)
+        if isinstance(node.op, ast.UAdd):
+            return _check_result(+value)
+        raise ValueError("unsupported unary operator")
+    if isinstance(node, ast.BinOp):
+        left = _eval_node(node.left)
+        right = _eval_node(node.right)
+        op = node.op
+        if isinstance(op, ast.Pow):
+            return _safe_pow(left, right)
+        if isinstance(op, ast.Add):
+            return _check_result(left + right)
+        if isinstance(op, ast.Sub):
+            return _check_result(left - right)
+        if isinstance(op, ast.Mult):
+            return _check_result(left * right)
+        if isinstance(op, ast.Div):
+            return _check_result(left / right)
+        if isinstance(op, ast.FloorDiv):
+            return _check_result(left // right)
+        if isinstance(op, ast.Mod):
+            return _check_result(left % right)
+        raise ValueError("unsupported operator")
+    raise ValueError("not a plain arithmetic expression")
+
+
+def safe_eval(expr: str) -> float | int:
+    """Evaluate a plain arithmetic expression. Raises ValueError on anything
+    that is not pure arithmetic (no names, calls, attributes, imports),
+    and on any computation whose result would be unreasonably large.
+    Never uses eval() — the expression is walked node by node."""
+    if len(expr) > _MAX_ARITH_EXPR_LEN:
+        raise ValueError("expression too long")
+    tree = ast.parse(expr, mode="eval")
+    for node in ast.walk(tree):
+        if not isinstance(node, _ALLOWED_NODES):
+            raise ValueError("not a plain arithmetic expression")
+        if isinstance(node, ast.Constant) and not isinstance(
+            node.value, (int, float)
+        ):
+            raise ValueError("only numbers are allowed")
+    try:
+        result = _eval_node(tree)
+    except OverflowError:
+        # e.g. int/int division whose quotient overflows a float.
+        raise ValueError("that number is too large to compute") from None
+    if not isinstance(result, (int, float)):
+        raise ValueError("not a number")
+    return result
+
+
+_ARITH_RE = re.compile(r"^[\d\s\.\+\-\*\/\%\(\)]+$")
+
+
+def _try_arithmetic(question: str) -> str | None:
+    """Return an answer if the question is (or contains) arithmetic."""
+    q = question.strip()
+    lowered = q.lower()
+    for prefix in ("calculate ", "calc ", "what is ", "what's ", "compute ", "solve "):
+        if lowered.startswith(prefix):
+            q = q[len(prefix):].strip()
+            lowered = q.lower()
+            break
+    q = q.rstrip("?").strip()
+    if _ARITH_RE.match(q) and any(ch.isdigit() for ch in q) and any(
+        op in q for op in "+-*/%"
+    ):
+        try:
+            return f"{q} = {safe_eval(q)}"
+        except (ValueError, SyntaxError, ZeroDivisionError, OverflowError):
+            return "That arithmetic didn't work — check the expression and try again."
+    return None
+
+
+# ---------------------------------------------------------------------------
+# /ask — rule-based answers about the vault, notes, time, and capabilities.
+# ---------------------------------------------------------------------------
+
+HELP_BLURB = (
+    "I am the keeper of the Sanctum Sanctorum — guardian of your vault, not "
+    "a distant mind. I have no external AI; I run entirely on this server, "
+    "and I can help with:\n"
+    "• your vault — /list, /search, /get, /delete, /stats\n"
+    "• notes — /note, /notes, /delnote\n"
+    "• reminders — /remind <minutes> <text>\n"
+    "• simple arithmetic, and the date/time.\n"
+    "For deeper conversation, use /chat <message> — with a free Gemini key "
+    "I can borrow a greater mind; without one, my own local wit will have "
+    "to do.\n"
+    "Ask me things like 'how many files do I have?', 'what notes do I have "
+    "about exams?', 'what is 45 * 12?' — or just say 'tell me a joke'."
+)
+
+
+def _answer_ask_inner(question: str, store: Store, user_id: int) -> str | None:
+    """Answer a question with local rules only. Returns None when no rule
+    matches, so callers can choose their own fallback. Never invents facts.
+    Every vault/notes lookup is scoped to `user_id` — the caller only
+    ever sees their own vault."""
+    q = (question or "").strip()
+    if not q:
+        return HELP_BLURB
+    lowered = q.lower()
+
+    # Arithmetic first.
+    arith = _try_arithmetic(q)
+    if arith is not None:
+        return arith
+
+    # Date / time.
+    if any(p in lowered for p in ("what time", "what's the time", "current time", "time is it")):
+        return "It is " + datetime.now().astimezone().strftime("%A, %d %B %Y, %H:%M %Z") + " (server local time)."
+    if any(p in lowered for p in ("what date", "what's the date", "what day is it", "today's date", "todays date")):
+        return "Today is " + datetime.now().astimezone().strftime("%A, %d %B %Y") + "."
+
+    # Identity / capabilities.
+    if any(p in lowered for p in ("who are you", "what are you", "your name")):
         return (
             "I am the Sanctum Sanctorum — keeper of this vault, guardian of "
             "your files and notes. I dwell on this server alone: no cloud, "
@@ -510,4 +726,4 @@ def schedule_reminder(job_queue, chat_id: int, minutes: int, text: str):
         when=minutes * 60,
         data={"chat_id": chat_id, "text": text},
         name=f"remind-{chat_id}-{minutes}",
-)
+    )
