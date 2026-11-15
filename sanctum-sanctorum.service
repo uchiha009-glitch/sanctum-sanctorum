@@ -1,0 +1,36 @@
+# Sanctum Sanctorum — systemd service unit.
+#
+# Install:
+#   1. Put this project at /home/hatch/workspace/sanctum-sanctorum
+#      (or change WorkingDirectory / ExecStart below to match your path).
+#   2. Create a Python venv and install requirements:
+#        python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+#   3. Copy .env.example to .env and fill in TELEGRAM_BOT_TOKEN and OWNER_ID.
+#   4. sudo cp sanctum-sanctorum.service /etc/systemd/system/
+#      sudo systemctl daemon-reload
+#      sudo systemctl enable --now sanctum-sanctorum
+#   5. Check it: sudo systemctl status sanctum-sanctorum
+#      Logs:    sudo journalctl -u sanctum-sanctorum -f
+
+[Unit]
+Description=Sanctum Sanctorum Telegram bot (personal file vault)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Runs as a dedicated unprivileged user (never root): a compromised bot
+# must not own the machine. The project directory (including .env and
+# data/) is owned by this user. The watchdog (ensure-running.sh)
+# reinstalls this unit from the project file, so this file is the
+# source of truth after a VM replacement.
+User=sanctum
+Group=sanctum
+WorkingDirectory=/home/hatch/workspace/sanctum-sanctorum
+EnvironmentFile=/home/hatch/workspace/sanctum-sanctorum/.env
+ExecStart=/home/hatch/workspace/sanctum-sanctorum/.venv/bin/python bot.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
