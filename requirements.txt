@@ -1,0 +1,8 @@
+python-telegram-bot[job-queue]>=21,<22
+cryptography>=42,<52
+# Note: no google-generativeai — ai.py calls the Gemini REST API directly
+# with httpx (already a dependency of python-telegram-bot). The
+# google-generativeai SDK is deprecated and its gRPC transport does not
+# work through this server's egress proxy.
+# cryptography is for keystore.py: users' linked Gemini keys are stored
+# encrypted at rest (Fernet).
